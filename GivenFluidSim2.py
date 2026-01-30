@@ -53,12 +53,19 @@ JET_R = CenteredGrid(
 NUM_STEPS = 80
 CONTROL_START = 40  # timestep when jet control kicks in
 
+# Precomputed control mask: 0 before CONTROL_START, 1 after
+# IMPORTANT: Recreate this whenever you change CONTROL_START!
+control_mask = math.tensor(
+    [0.0 if t < CONTROL_START else 1.0 for t in range(NUM_STEPS)],
+    batch('time')
+)
+
 # Unconstrained parameters for optimization (will be mapped through tanh)
 uL = math.zeros(batch(time=NUM_STEPS))
 uR = math.zeros(batch(time=NUM_STEPS))
 
 # Maximum jet strength (bounded via tanh)
-A_MAX = 5.0   # start small, can raise later
+A_MAX = 1.0   # keep small for gradient stability; raise to 2, 3, 5 once stable
 
 # Diagnostic: check inflow masses for discretization differences.
 print("inflow_A_mass_per_step:", math.sum(INFLOW_A.values))
@@ -69,38 +76,44 @@ def step(dye_A: CenteredGrid, dye_B: CenteredGrid, velocity: StaggeredGrid, aL_t
   dye_A = advect.mac_cormack(dye_A, velocity, dt=1) + INFLOW_A
   dye_B = advect.mac_cormack(dye_B, velocity, dt=1) + INFLOW_B
   total = dye_A + dye_B
-  buoyancy_force = total * (0, 0.5) @ velocity
+  buoyancy_force = (total * vec(x=0, y=0.5)) @ velocity
   jet_force_centered = (aL_t * JET_L - aR_t * JET_R) * vec(x=1, y=0)
   velocity = velocity + (buoyancy_force + jet_force_centered @ velocity)
   velocity = advect.semi_lagrangian(velocity, velocity, dt=1)
-  velocity, _ = fluid.make_incompressible(velocity, (), Solve(rank_deficiency=0))
+  velocity, _ = fluid.make_incompressible(velocity, (), Solve(rel_tol=1e-3, abs_tol=1e-3, max_iterations=1000))
 
   return dye_A, dye_B, velocity
 
 # Roll out a trajectory and stack dye frames over time for visualization.
-def rollout(dye_A0: CenteredGrid, dye_B0: CenteredGrid, vel0: StaggeredGrid, actions_L, actions_R, print_mass=False):
+def rollout(dye_A0: CenteredGrid, dye_B0: CenteredGrid, vel0: StaggeredGrid, actions_L, actions_R, print_mass=False, debug=False):
   steps = actions_L.shape.get_size('time')
   frames_A = [dye_A0]
   frames_B = [dye_B0]
   dye_A, dye_B, vel = dye_A0, dye_B0, vel0
   for t in range(steps):
-    # No jet control until CONTROL_START, then use bounded actions via tanh
-    if t < CONTROL_START:
-        aL_t = 0.0
-        aR_t = 0.0
-    else:
-        aL_t = A_MAX * math.tanh(actions_L.time[t])
-        aR_t = A_MAX * math.tanh(actions_R.time[t])
+    # Use precomputed mask: 0 before CONTROL_START, 1 after
+    mask_t = control_mask.time[t]
+    aL_t = mask_t * A_MAX * math.tanh(actions_L.time[t])
+    aR_t = mask_t * A_MAX * math.tanh(actions_R.time[t])
     
-    if t == CONTROL_START:
+    if debug and t == CONTROL_START:
       print(f"ASSERT t={t}: uL.time[t]={actions_L.time[t]}, tanh(uL.time[t])={math.tanh(actions_L.time[t])}, aL_t={aL_t}")
     
     dye_A, dye_B, vel = step(dye_A, dye_B, vel, aL_t, aR_t)
+    
+    # Detect NaNs early (only in debug mode to avoid tensor->float during grad)
+    if debug:
+      vmax = math.max(math.abs(vel.values))
+      vmax_f = float(vmax.native().detach())
+      if vmax_f != vmax_f:  # NaN check
+        print(f"NaN vel at t={t}, aL_t={aL_t}, aR_t={aR_t}")
+        break
+    
     frames_A.append(dye_A)
     frames_B.append(dye_B)
     
     # Diagnostic print for timesteps around CONTROL_START (after step)
-    if CONTROL_START - 2 <= t <= CONTROL_START + 10:
+    if debug and CONTROL_START - 2 <= t <= CONTROL_START + 10:
       vel_comp_max = math.max(math.abs(vel.values))
       mass_A = math.sum(dye_A.values)
       mass_B = math.sum(dye_B.values)
@@ -120,7 +133,10 @@ def rollout(dye_A0: CenteredGrid, dye_B0: CenteredGrid, vel0: StaggeredGrid, act
 def compute_loss(actions_L, actions_R):
   """Run simulation and compute loss = -purity (to maximize separation)."""
   _traj_A, _traj_B, final_A, final_B = rollout(
-    initial_dye_A, initial_dye_B, initial_velocity, actions_L, actions_R
+    initial_dye_A, initial_dye_B, initial_velocity,
+    actions_L, actions_R,
+    print_mass=False,
+    debug=False
   )
   
   # Compute mass in correct region vs wrong region.
@@ -137,8 +153,8 @@ def compute_loss(actions_L, actions_R):
   return loss
 
 # Objective wrapper for gradient computation.
-def objective(actions_L, actions_R):
-  return compute_loss(actions_L, actions_R)
+def objective(uL, uR):
+  return compute_loss(uL, uR)
 
 initial_dye_A = CenteredGrid(0, extrapolation.BOUNDARY, x=32, y=40, bounds=Box(x=32, y=40))
 initial_dye_B = CenteredGrid(0, extrapolation.BOUNDARY, x=32, y=40, bounds=Box(x=32, y=40))
@@ -146,10 +162,11 @@ initial_velocity = StaggeredGrid(0, extrapolation.ZERO, x=32, y=40, bounds=Box(x
 
 # Gradient descent on actions.
 lr = 1e-2
-grad_fn = math.gradient(objective, wrt='actions_L,actions_R', get_output=True)
+grad_fn = math.gradient(objective, wrt='uL,uR', get_output=True)
 
 print("Initial loss:", compute_loss(uL, uR))
 
+print("Sanity forward loss (no grad):", compute_loss(uL, uR))
 (loss, (d_uL, d_uR)) = grad_fn(uL, uR)
 
 # Visualize the gradients over time.
@@ -171,9 +188,9 @@ ax2.legend()
 fig_grad.tight_layout()
 
 # Clip gradients before update
-gmax = 1.0
-d_uL = math.clip(d_uL, -gmax, gmax)
-d_uR = math.clip(d_uR, -gmax, gmax)
+CLIP = 100.0  # start here; adjust
+d_uL = math.clip(d_uL, -CLIP, CLIP)
+d_uR = math.clip(d_uR, -CLIP, CLIP)
 
 uL = uL - lr * d_uL
 uR = uR - lr * d_uR
@@ -182,7 +199,7 @@ print("After 1 step, loss:", compute_loss(uL, uR))
 
 # Run simulation with updated actions for visualization.
 print("\n--- Mass tracking every 10 timesteps ---")
-traj_A, traj_B, final_A, final_B = rollout(initial_dye_A, initial_dye_B, initial_velocity, uL, uR, print_mass=True)
+traj_A, traj_B, final_A, final_B = rollout(initial_dye_A, initial_dye_B, initial_velocity, uL, uR, print_mass=True, debug=True)
 
 # Stack both dye trajectories along a batch dimension so they appear on the same figure.
 traj_combined = field.stack([traj_A, traj_B], batch(dye=['A', 'B']))
