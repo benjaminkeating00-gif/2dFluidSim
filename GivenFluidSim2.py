@@ -51,7 +51,7 @@ JET_R = CenteredGrid(
 # Jet action tensors: differentiable time-series controls.
 # Left jet blows +x (right), right jet blows -x (left).
 NUM_STEPS = 80
-CONTROL_START = 40  # timestep when jet control kicks in
+CONTROL_START = 10  # timestep when jet control kicks in
 
 # Precomputed control mask: 0 before CONTROL_START, 1 after
 # IMPORTANT: Recreate this whenever you change CONTROL_START!
@@ -60,21 +60,29 @@ control_mask = math.tensor(
     batch('time')
 )
 
+# Inflow fill phase: inflow active for t < FILL_END, then stops
+# IMPORTANT: Recreate this whenever you change FILL_END!
+FILL_END = 5  # timestep when inflow stops
+inflow_mask = math.tensor(
+    [1.0 if t < FILL_END else 0.0 for t in range(NUM_STEPS)],
+    batch('time')
+)
+
 # Unconstrained parameters for optimization (will be mapped through tanh)
 uL = math.zeros(batch(time=NUM_STEPS))
 uR = math.zeros(batch(time=NUM_STEPS))
 
 # Maximum jet strength (bounded via tanh)
-A_MAX = 1.0   # keep small for gradient stability; raise to 2, 3, 5 once stable
+A_MAX = 1000.0   # keep small for gradient stability; raise to 2, 3, 5 once stable
 
 # Diagnostic: check inflow masses for discretization differences.
 print("inflow_A_mass_per_step:", math.sum(INFLOW_A.values))
 print("inflow_B_mass_per_step:", math.sum(INFLOW_B.values))
 
 # Perform one physics timestep including advection, buoyancy, and projection.
-def step(dye_A: CenteredGrid, dye_B: CenteredGrid, velocity: StaggeredGrid, aL_t: float, aR_t: float):
-  dye_A = advect.mac_cormack(dye_A, velocity, dt=1) + INFLOW_A
-  dye_B = advect.mac_cormack(dye_B, velocity, dt=1) + INFLOW_B
+def step(dye_A: CenteredGrid, dye_B: CenteredGrid, velocity: StaggeredGrid, aL_t: float, aR_t: float, inflow_scale=1.0):
+  dye_A = advect.mac_cormack(dye_A, velocity, dt=1) + inflow_scale * INFLOW_A
+  dye_B = advect.mac_cormack(dye_B, velocity, dt=1) + inflow_scale * INFLOW_B
   total = dye_A + dye_B
   buoyancy_force = (total * vec(x=0, y=0.5)) @ velocity
   jet_force_centered = (aL_t * JET_L - aR_t * JET_R) * vec(x=1, y=0)
@@ -99,7 +107,17 @@ def rollout(dye_A0: CenteredGrid, dye_B0: CenteredGrid, vel0: StaggeredGrid, act
     if debug and t == CONTROL_START:
       print(f"ASSERT t={t}: uL.time[t]={actions_L.time[t]}, tanh(uL.time[t])={math.tanh(actions_L.time[t])}, aL_t={aL_t}")
     
-    dye_A, dye_B, vel = step(dye_A, dye_B, vel, aL_t, aR_t)
+    # Get inflow scale for this timestep (1.0 before FILL_END, 0.0 after)
+    inflow_t = inflow_mask.time[t]
+    
+    # Debug: verify inflow mask is actually being applied
+    if debug and t in [FILL_END-1, FILL_END, FILL_END+1, FILL_END+5]:
+      print("t", t, "inflow_t", float(inflow_t.native()))
+      addA = math.sum((inflow_t * INFLOW_A).values)
+      addB = math.sum((inflow_t * INFLOW_B).values)
+      print("   addedA", float(addA.native()), "addedB", float(addB.native()))
+    
+    dye_A, dye_B, vel = step(dye_A, dye_B, vel, aL_t, aR_t, inflow_scale=inflow_t)
     
     # Detect NaNs early (only in debug mode to avoid tensor->float during grad)
     if debug:
@@ -161,7 +179,7 @@ initial_dye_B = CenteredGrid(0, extrapolation.BOUNDARY, x=32, y=40, bounds=Box(x
 initial_velocity = StaggeredGrid(0, extrapolation.ZERO, x=32, y=40, bounds=Box(x=32, y=40))
 
 # Gradient descent on actions.
-lr = 1e-2
+lr = 1e-3
 grad_fn = math.gradient(objective, wrt='uL,uR', get_output=True)
 
 print("Initial loss:", compute_loss(uL, uR))
