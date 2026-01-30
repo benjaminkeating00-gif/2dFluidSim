@@ -169,22 +169,46 @@ print("Initial loss:", compute_loss(uL, uR))
 print("Sanity forward loss (no grad):", compute_loss(uL, uR))
 (loss, (d_uL, d_uR)) = grad_fn(uL, uR)
 
-# Visualize the gradients over time.
-fig_grad, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+# Visualize the gradients over time (2x2: linear on top, log magnitude on bottom)
+import numpy as np
+fig_grad, ((ax1, ax2), (ax1b, ax2b)) = plt.subplots(2, 2, figsize=(12, 8))
 timesteps = list(range(NUM_STEPS))
+
+# Top row: linear gradients
 ax1.plot(timesteps, d_uL.native('time'), label='d_uL')
 ax1.axvline(x=CONTROL_START, color='r', linestyle='--', label='control start')
 ax1.set_xlabel('timestep')
 ax1.set_ylabel('gradient')
-ax1.set_title('Gradient w.r.t. left jet (uL)')
+ax1.set_title('Gradient w.r.t. left jet (uL) - Linear')
 ax1.legend()
 
 ax2.plot(timesteps, d_uR.native('time'), label='d_uR')
 ax2.axvline(x=CONTROL_START, color='r', linestyle='--', label='control start')
 ax2.set_xlabel('timestep')
 ax2.set_ylabel('gradient')
-ax2.set_title('Gradient w.r.t. right jet (uR)')
+ax2.set_title('Gradient w.r.t. right jet (uR) - Linear')
 ax2.legend()
+
+# Bottom row: log magnitude (convert to numpy explicitly to avoid deprecation warnings)
+gL_native = d_uL.native('time').detach().cpu().numpy()
+gR_native = d_uR.native('time').detach().cpu().numpy()
+gL = np.abs(gL_native)
+gR = np.abs(gR_native)
+
+ax1b.plot(timesteps, np.log10(gL + 1e-12), label='log10(|d_uL|)')
+ax1b.axvline(x=CONTROL_START, color='r', linestyle='--', label='control start')
+ax1b.set_xlabel('timestep')
+ax1b.set_ylabel('log10(|gradient|)')
+ax1b.set_title('Gradient w.r.t. left jet (uL) - Log Magnitude')
+ax1b.legend()
+
+ax2b.plot(timesteps, np.log10(gR + 1e-12), label='log10(|d_uR|)')
+ax2b.axvline(x=CONTROL_START, color='r', linestyle='--', label='control start')
+ax2b.set_xlabel('timestep')
+ax2b.set_ylabel('log10(|gradient|)')
+ax2b.set_title('Gradient w.r.t. right jet (uR) - Log Magnitude')
+ax2b.legend()
+
 fig_grad.tight_layout()
 
 # Clip gradients before update
