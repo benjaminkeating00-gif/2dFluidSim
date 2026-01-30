@@ -28,13 +28,13 @@ def make_inflow_B():
 INFLOW_A = make_inflow_A()
 INFLOW_B = make_inflow_B()
 
-# Region masks: left half for dye_A, right half for dye_B.
+# Region masks: right half for dye_A, left half for dye_B.
 REGION_A = CenteredGrid(
-  Box(vec(x=0, y=0), vec(x=16, y=40)),
+  Box(vec(x=16, y=0), vec(x=32, y=40)),
   extrapolation.ZERO, x=32, y=40, bounds=Box(x=32, y=40),
 )
 REGION_B = CenteredGrid(
-  Box(vec(x=16, y=0), vec(x=32, y=40)),
+  Box(vec(x=0, y=0), vec(x=16, y=40)),
   extrapolation.ZERO, x=32, y=40, bounds=Box(x=32, y=40),
 )
 
@@ -48,14 +48,17 @@ JET_R = CenteredGrid(
   extrapolation.ZERO, x=32, y=40, bounds=Box(x=32, y=40),
 )
 
-# Jet action arrays: left jet blows +x (right), right jet blows -x (left).
-# Each array has one value per timestep.
+# Jet action tensors: differentiable time-series controls.
+# Left jet blows +x (right), right jet blows -x (left).
 NUM_STEPS = 80
-CONTROL_START = 30  # timestep when jet control kicks in
-aL = [10.0] * NUM_STEPS  # strength of left jet at each timestep
-aR = [10.0] * NUM_STEPS  # strength of right jet at each timestep
+CONTROL_START = 40  # timestep when jet control kicks in
 
-type(INFLOW_A.values.native(INFLOW_A.shape))
+# Unconstrained parameters for optimization (will be mapped through tanh)
+uL = math.zeros(batch(time=NUM_STEPS))
+uR = math.zeros(batch(time=NUM_STEPS))
+
+# Maximum jet strength (bounded via tanh)
+A_MAX = 5.0   # start small, can raise later
 
 # Diagnostic: check inflow masses for discretization differences.
 print("inflow_A_mass_per_step:", math.sum(INFLOW_A.values))
@@ -75,75 +78,115 @@ def step(dye_A: CenteredGrid, dye_B: CenteredGrid, velocity: StaggeredGrid, aL_t
   return dye_A, dye_B, velocity
 
 # Roll out a trajectory and stack dye frames over time for visualization.
-def rollout(dye_A0: CenteredGrid, dye_B0: CenteredGrid, vel0: StaggeredGrid, actions_L: list, actions_R: list):
-  steps = len(actions_L)
+def rollout(dye_A0: CenteredGrid, dye_B0: CenteredGrid, vel0: StaggeredGrid, actions_L, actions_R, print_mass=False):
+  steps = actions_L.shape.get_size('time')
   frames_A = [dye_A0]
   frames_B = [dye_B0]
   dye_A, dye_B, vel = dye_A0, dye_B0, vel0
   for t in range(steps):
-    # No jet control until CONTROL_START
-    aL_t = 0.0 if t < CONTROL_START else actions_L[t]
-    aR_t = 0.0 if t < CONTROL_START else actions_R[t]
+    # No jet control until CONTROL_START, then use bounded actions via tanh
+    if t < CONTROL_START:
+        aL_t = 0.0
+        aR_t = 0.0
+    else:
+        aL_t = A_MAX * math.tanh(actions_L.time[t])
+        aR_t = A_MAX * math.tanh(actions_R.time[t])
+    
+    if t == CONTROL_START:
+      print(f"ASSERT t={t}: uL.time[t]={actions_L.time[t]}, tanh(uL.time[t])={math.tanh(actions_L.time[t])}, aL_t={aL_t}")
+    
     dye_A, dye_B, vel = step(dye_A, dye_B, vel, aL_t, aR_t)
     frames_A.append(dye_A)
     frames_B.append(dye_B)
-  traj_A = field.stack(frames_A, batch('time'))
-  traj_B = field.stack(frames_B, batch('time'))
-  return traj_A, traj_B
+    
+    # Diagnostic print for timesteps around CONTROL_START (after step)
+    if CONTROL_START - 2 <= t <= CONTROL_START + 10:
+      vel_comp_max = math.max(math.abs(vel.values))
+      mass_A = math.sum(dye_A.values)
+      mass_B = math.sum(dye_B.values)
+      print(f"t={t}: aL_t={aL_t}, aR_t={aR_t}, vel_comp_max={vel_comp_max:.4f}, mass_A={mass_A:.4f}, mass_B={mass_B:.4f}")
+    
+    # Print mass every 10 timesteps
+    if print_mass and (t + 1) % 10 == 0:
+      mass_A = math.sum(dye_A.values)
+      mass_B = math.sum(dye_B.values)
+      total_mass = mass_A + mass_B
+      print(f"Timestep {t + 1}: mass_A = {mass_A:.4f}, mass_B = {mass_B:.4f}, total = {total_mass:.4f}")
+  traj_A = field.stack(frames_A, batch('traj_time'))
+  traj_B = field.stack(frames_B, batch('traj_time'))
+  return traj_A, traj_B, dye_A, dye_B
+
+# Differentiable loss function: takes actions, returns negative purity.
+def compute_loss(actions_L, actions_R):
+  """Run simulation and compute loss = -purity (to maximize separation)."""
+  _traj_A, _traj_B, final_A, final_B = rollout(
+    initial_dye_A, initial_dye_B, initial_velocity, actions_L, actions_R
+  )
+  
+  # Compute mass in correct region vs wrong region.
+  A_in_A = math.sum((final_A * REGION_A).values)
+  B_in_B = math.sum((final_B * REGION_B).values)
+  A_in_B = math.sum((final_A * REGION_B).values)
+  B_in_A = math.sum((final_B * REGION_A).values)
+  
+  correct = A_in_A + B_in_B
+  wrong = A_in_B + B_in_A
+  purity = correct / (correct + wrong + 1e-8)
+  
+  loss = -purity  # minimize negative purity = maximize purity
+  return loss
+
+# Objective wrapper for gradient computation.
+def objective(actions_L, actions_R):
+  return compute_loss(actions_L, actions_R)
 
 initial_dye_A = CenteredGrid(0, extrapolation.BOUNDARY, x=32, y=40, bounds=Box(x=32, y=40))
 initial_dye_B = CenteredGrid(0, extrapolation.BOUNDARY, x=32, y=40, bounds=Box(x=32, y=40))
 initial_velocity = StaggeredGrid(0, extrapolation.ZERO, x=32, y=40, bounds=Box(x=32, y=40))
 
-traj_A, traj_B = rollout(initial_dye_A, initial_dye_B, initial_velocity, aL, aR)
+# Gradient descent on actions.
+lr = 1e-2
+grad_fn = math.gradient(objective, wrt='actions_L,actions_R', get_output=True)
 
-# Grab the final frame from each trajectory.
-final_A = traj_A.time[-1]
-final_B = traj_B.time[-1]
+print("Initial loss:", compute_loss(uL, uR))
 
-# Compute mass in correct region vs wrong region.
-A_in_A = math.sum((final_A * REGION_A).values)  # dye A in left half (correct)
-B_in_B = math.sum((final_B * REGION_B).values)  # dye B in right half (correct)
-A_in_B = math.sum((final_A * REGION_B).values)  # dye A in right half (wrong)
-B_in_A = math.sum((final_B * REGION_A).values)  # dye B in left half (wrong)
+(loss, (d_uL, d_uR)) = grad_fn(uL, uR)
 
-# Overlap diagnostic: how much dye_A and dye_B occupy the same cells.
-overlap = math.sum((final_A * final_B).values)
+# Visualize the gradients over time.
+fig_grad, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+timesteps = list(range(NUM_STEPS))
+ax1.plot(timesteps, d_uL.native('time'), label='d_uL')
+ax1.axvline(x=CONTROL_START, color='r', linestyle='--', label='control start')
+ax1.set_xlabel('timestep')
+ax1.set_ylabel('gradient')
+ax1.set_title('Gradient w.r.t. left jet (uL)')
+ax1.legend()
 
-# Aggregate metrics.
-correct = A_in_A + B_in_B
-wrong   = A_in_B + B_in_A
-total   = correct + wrong
+ax2.plot(timesteps, d_uR.native('time'), label='d_uR')
+ax2.axvline(x=CONTROL_START, color='r', linestyle='--', label='control start')
+ax2.set_xlabel('timestep')
+ax2.set_ylabel('gradient')
+ax2.set_title('Gradient w.r.t. right jet (uR)')
+ax2.legend()
+fig_grad.tight_layout()
 
-purity = correct / (total + 1e-8)                    # 0..1, higher = better
-normalized_sep = (correct - wrong) / (total + 1e-8) # -1..1, higher = better
-wrong_frac = wrong / (total + 1e-8)                 # 0..1, lower = better
+# Clip gradients before update
+gmax = 1.0
+d_uL = math.clip(d_uL, -gmax, gmax)
+d_uR = math.clip(d_uR, -gmax, gmax)
 
-print("correct:", correct, "wrong:", wrong, "total:", total)
-print("purity:", purity)
-print("normalized_sep:", normalized_sep)
-print("wrong_frac:", wrong_frac)
+uL = uL - lr * d_uL
+uR = uR - lr * d_uR
 
-# Per-dye purity.
-A_total = A_in_A + A_in_B
-B_total = B_in_A + B_in_B
+print("After 1 step, loss:", compute_loss(uL, uR))
 
-A_purity = A_in_A / (A_total + 1e-8)  # fraction of A on correct side
-B_purity = B_in_B / (B_total + 1e-8)  # fraction of B on correct side
-
-print("A_purity:", A_purity, "B_purity:", B_purity)
-
-# Normalized overlap (scale-free).
-A_mass = math.sum(final_A.values)
-B_mass = math.sum(final_B.values)
-overlap_norm = overlap / (A_mass * B_mass + 1e-8)
-
-print("A_mass:", A_mass, "B_mass:", B_mass)
-print("overlap:", overlap, "overlap_norm:", overlap_norm)
+# Run simulation with updated actions for visualization.
+print("\n--- Mass tracking every 10 timesteps ---")
+traj_A, traj_B, final_A, final_B = rollout(initial_dye_A, initial_dye_B, initial_velocity, uL, uR, print_mass=True)
 
 # Stack both dye trajectories along a batch dimension so they appear on the same figure.
 traj_combined = field.stack([traj_A, traj_B], batch(dye=['A', 'B']))
-anim = vis.plot(traj_combined, animate='time')
+anim = vis.plot(traj_combined, animate='traj_time')
 
 # --------------------------
 # Display any generated plots or animations.
