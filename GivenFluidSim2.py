@@ -81,8 +81,8 @@ print("inflow_B_mass_per_step:", math.sum(INFLOW_B.values))
 
 # Perform one physics timestep including advection, buoyancy, and projection.
 def step(dye_A: CenteredGrid, dye_B: CenteredGrid, velocity: StaggeredGrid, aL_t: float, aR_t: float, inflow_scale=1.0):
-  dye_A = advect.mac_cormack(dye_A, velocity, dt=1) + inflow_scale * INFLOW_A
-  dye_B = advect.mac_cormack(dye_B, velocity, dt=1) + inflow_scale * INFLOW_B
+  dye_A = advect.semi_lagrangian(dye_A, velocity, dt=1) + inflow_scale * INFLOW_A
+  dye_B = advect.semi_lagrangian(dye_B, velocity, dt=1) + inflow_scale * INFLOW_B
   total = dye_A + dye_B
   buoyancy_force = (total * vec(x=0, y=0.5)) @ velocity
   jet_force_centered = (aL_t * JET_L - aR_t * JET_R) * vec(x=1, y=0)
@@ -116,6 +116,22 @@ def rollout(dye_A0: CenteredGrid, dye_B0: CenteredGrid, vel0: StaggeredGrid, act
       addA = math.sum((inflow_t * INFLOW_A).values)
       addB = math.sum((inflow_t * INFLOW_B).values)
       print("   addedA", float(addA.native()), "addedB", float(addB.native()))
+    
+    # MacCormack instrumentation: compare predictor vs corrector (disabled)
+    # if debug:
+    #   pred_A = advect.semi_lagrangian(dye_A, vel, dt=1)
+    #   pred_B = advect.semi_lagrangian(dye_B, vel, dt=1)
+    #   corr_A = advect.mac_cormack(dye_A, vel, dt=1)
+    #   corr_B = advect.mac_cormack(dye_B, vel, dt=1)
+    #   delta_A = corr_A - pred_A
+    #   delta_B = corr_B - pred_B
+    #   sum_delta_A = float(math.sum(delta_A.values).native())
+    #   sum_delta_B = float(math.sum(delta_B.values).native())
+    #   mean_delta_A = float(math.mean(delta_A.values).native())
+    #   mean_delta_B = float(math.mean(delta_B.values).native())
+    #   print(f"t={t}: MacCormack correction bias: "
+    #         f"sum(delta_A)={sum_delta_A:+.6f}, sum(delta_B)={sum_delta_B:+.6f}, "
+    #         f"mean(delta_A)={mean_delta_A:+.8f}, mean(delta_B)={mean_delta_B:+.8f}")
     
     dye_A, dye_B, vel = step(dye_A, dye_B, vel, aL_t, aR_t, inflow_scale=inflow_t)
     
